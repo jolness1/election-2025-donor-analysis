@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 import time
 from collections import defaultdict
@@ -45,9 +46,9 @@ def run_playwright_for_eid(page, eid: str, timeout: int = 15000) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Aggregate FTM party totals per donor from eids CSV using Playwright")
-    p.add_argument("--in", dest="in_csv", default="output/donors-kisa-davison.csv",
-                   help="Input donors CSV (must contain 'eid' and name columns)")
-    p.add_argument("--out-dir", dest="out_dir", default="by-donor-output/kisa-davison",
+    p.add_argument("--in-dir", dest="in_dir", default="output",
+                   help="Input directory containing donors-*.csv (must contain 'eid' and name columns)")
+    p.add_argument("--out-dir", dest="out_dir", default="by-donor-output",
                    help="Output directory for per-party CSVs")
     p.add_argument("--sleep", type=float, default=0.5, help="Seconds to sleep between requests")
     p.add_argument("--timeout", type=int, default=15000, help="Playwright response wait timeout in ms")
@@ -55,74 +56,125 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--headful", action="store_true", help="Run browser in headful mode (for debugging)")
     args = p.parse_args(argv)
 
-    in_csv = args.in_csv
+    in_dir = args.in_dir
     out_dir = args.out_dir
-    if not os.path.exists(in_csv):
-        print(f"Input CSV not found: {in_csv}", file=sys.stderr)
+    if not os.path.isdir(in_dir):
+        print(f"Input directory not found: {in_dir}", file=sys.stderr)
         return 2
 
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-    # Read donors file and build eid -> set of person tuples
-    eid_to_people: Dict[str, set[Tuple[str, str, str]]] = {}
-    with open(in_csv, newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            eid = (row.get("eid") or "").strip()
-            if not eid:
-                continue
-            entityName = (row.get("entityName") or "").strip()
-            first = (row.get("firstName") or "").strip()
-            last = (row.get("lastName") or "").strip()
-            eid_to_people.setdefault(eid, set()).add((entityName, first, last))
+    # Read all donors-*.csv files in in_dir and build mappings:
+    # - eid_to_group: eid -> group_key
+    # - group_info: group_key -> representative fields and donationsToCampaign
+    eid_to_group: Dict[str, Tuple[str, str, str, str, str, str]] = {}
+    group_info: Dict[Tuple[str, str, str, str, str, str], dict] = {}
 
-    if not eid_to_people:
-        print("No eids found in input CSV.", file=sys.stderr)
+    csv_paths = sorted([str(p) for p in Path(in_dir).glob("donors-*.csv")])
+    if not csv_paths:
+        print(f"No donors-*.csv files found in {in_dir}", file=sys.stderr)
         return 0
-
-    # accumulator: party -> (entityName, first, last) -> amount
-    party_map: Dict[str, Dict[Tuple[str, str, str], float]] = defaultdict(lambda: defaultdict(float))
-
-    eids = list(eid_to_people.keys())
-    if args.limit and args.limit > 0:
-        eids = eids[: args.limit]
 
     with sync_playwright() as pplay:
         browser = pplay.chromium.launch(headless=not args.headful)
         context = browser.new_context()
         page = context.new_page()
 
-        for idx, eid in enumerate(eids, start=1):
-            print(f"[{idx}/{len(eids)}] Fetching eid={eid}")
-            data = run_playwright_for_eid(page, eid, timeout=args.timeout)
-            records = data.get("records") or []
-            for rec in records:
-                party = rec.get("Party", {}).get("Party")
-                amt = parse_float(rec.get("Total_$", {}).get("Total_$"))
-                if not party or amt <= 0:
-                    continue
-                people = eid_to_people.get(eid, set())
-                for person in people:
-                    party_map[party][person] += amt
+        # Process each candidate file independently
+        for csv_path in csv_paths:
+            base = os.path.basename(csv_path)
+            candidate = os.path.splitext(base)[0].replace("donors-", "")
+            candidate_out_dir = os.path.join(out_dir, candidate)
+            Path(candidate_out_dir).mkdir(parents=True, exist_ok=True)
 
-            time.sleep(args.sleep)
+            # build eid -> group and group info for this file
+            eid_to_group: Dict[str, Tuple[str, str, str, str, str, str]] = {}
+            group_info: Dict[Tuple[str, str, str, str, str, str], dict] = {}
+            with open(csv_path, newline="", encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    eid = (row.get("eid") or "").strip()
+                    if not eid:
+                        continue
+                    entityName = (row.get("entityName") or "").strip()
+                    first = (row.get("firstName") or "").strip()
+                    middle = (row.get("middleInitial") or "").strip()
+                    last = (row.get("lastName") or "").strip()
+                    city = (row.get("city") or "").strip()
+                    state = (row.get("state") or "").strip()
+                    donations_text = (row.get("donationsToCampaign") or "").strip()
+
+                    group_key = (entityName, first, middle, last, city, state)
+                    eid_to_group[eid] = group_key
+                    if group_key not in group_info:
+                        donations_val = 0.0
+                        try:
+                            donations_val = float(re.sub(r"[^0-9.-]", "", donations_text)) if donations_text else 0.0
+                        except Exception:
+                            donations_val = 0.0
+                        group_info[group_key] = {
+                            "entityName": entityName,
+                            "first": first,
+                            "middle": middle,
+                            "last": last,
+                            "city": city,
+                            "state": state,
+                            "donationsToCampaign": donations_val,
+                            "eids": set([eid]),
+                        }
+                    else:
+                        group_info[group_key]["eids"].add(eid)
+
+            all_eids = list(eid_to_group.keys())
+            if args.limit and args.limit > 0:
+                eids = all_eids[: args.limit]
+            else:
+                eids = all_eids
+
+            # accumulator: party -> group_key -> amount
+            party_map: Dict[str, Dict[Tuple[str, str, str, str, str, str], float]] = defaultdict(lambda: defaultdict(float))
+
+            for idx, eid in enumerate(eids, start=1):
+                print(f"[{candidate}] [{idx}/{len(eids)}] Fetching eid={eid}")
+                data = run_playwright_for_eid(page, eid, timeout=args.timeout)
+                records = data.get("records") or []
+                for rec in records:
+                    party = rec.get("Party", {}).get("Party")
+                    amt = parse_float(rec.get("Total_$", {}).get("Total_$"))
+                    if not party or amt <= 0:
+                        continue
+                    group_key = eid_to_group.get(eid)
+                    if not group_key:
+                        continue
+                    party_map[party][group_key] += amt
+
+                time.sleep(args.sleep)
+
+            # write per-party files for this candidate
+            for party, person_map in party_map.items():
+                safe = party.lower().replace(" ", "-")
+                out_path = os.path.join(candidate_out_dir, f"{safe}.csv")
+                with open(out_path, "w", newline="", encoding="utf-8") as outf:
+                    writer = csv.writer(outf)
+                    writer.writerow(["entityName", "firstName", "lastName", "amount", "donationsToCampaign"])
+                    for group_key, amt in sorted(person_map.items(), key=lambda kv: -kv[1]):
+                        info = group_info.get(group_key, {})
+                        entityName = info.get("entityName", "")
+                        first = info.get("first", "")
+                        last = info.get("last", "")
+                        donations_val = info.get("donationsToCampaign", 0.0)
+                        if float(amt).is_integer():
+                            amt_str = str(int(amt))
+                        else:
+                            amt_str = f"{amt:.2f}"
+                        if float(donations_val).is_integer():
+                            donations_str = str(int(donations_val))
+                        else:
+                            donations_str = f"{donations_val:.2f}"
+                        writer.writerow([entityName, first, last, amt_str, donations_str])
+                print(f"Wrote {out_path} ({len(person_map)} rows)")
 
         browser.close()
-
-    # write per-party files
-    for party, person_map in party_map.items():
-        safe = party.lower().replace(" ", "-")
-        out_path = os.path.join(out_dir, f"{safe}.csv")
-        with open(out_path, "w", newline="", encoding="utf-8") as outf:
-            writer = csv.writer(outf)
-            writer.writerow(["entityName", "firstName", "lastName", "amount"])
-            for (entityName, first, last), amt in sorted(person_map.items(), key=lambda kv: -kv[1]):
-                if float(amt).is_integer():
-                    amt_str = str(int(amt))
-                else:
-                    amt_str = f"{amt:.2f}"
-                writer.writerow([entityName, first, last, amt_str])
-        print(f"Wrote {out_path} ({len(person_map)} rows)")
 
     return 0
 
